@@ -8,12 +8,18 @@ static GByteArray *buf;
 
 static void insn_cb(unsigned int cpu_index, void *udata)
 {
-    qemu_plugin_read_register(first_reg, buf);
-    qemu_plugin_write_register(first_reg, buf);
+    g_byte_array_set_size(buf, 0);
+    if (qemu_plugin_read_register(first_reg, buf) > 0) {
+        qemu_plugin_write_register(first_reg, buf);
+    }
 }
 
 static void tb_trans(qemu_plugin_id_t id, struct qemu_plugin_tb *tb)
 {
+    if (!first_reg) {
+        return;
+    }
+
     size_t n = qemu_plugin_tb_n_insns(tb);
 
     for (size_t i = 0; i < n; i++) {
@@ -32,6 +38,11 @@ static void vcpu_init(qemu_plugin_id_t id, unsigned int vcpu_index)
                     qemu_plugin_reg_descriptor, 0);
         first_reg = rd->handle;
         buf = g_byte_array_new();
+        /* determine register size */
+        g_byte_array_set_size(buf, 0);
+        if (qemu_plugin_read_register(first_reg, buf) <= 0) {
+            first_reg = NULL;
+        }
     }
 }
 
