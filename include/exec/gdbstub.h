@@ -125,6 +125,16 @@ const GDBFeature *gdb_find_static_feature(const char *xmlname);
 int gdb_read_register(CPUState *cpu, GByteArray *buf, int reg);
 
 /**
+ * gdb_write_register() - Write a register associated with a CPU.
+ * @cpu: The CPU associated with the register.
+ * @buf: Buffer containing the register data in target byte order.
+ * @reg: The register's number returned by gdb_find_feature_register().
+ *
+ * Return: The number of written bytes.
+ */
+int gdb_write_register(CPUState *cpu, uint8_t *buf, int reg);
+
+/**
  * typedef GDBRegDesc - a register description from gdbstub
  */
 typedef struct {
