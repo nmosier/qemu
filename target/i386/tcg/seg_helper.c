@@ -1256,13 +1256,12 @@ void do_interrupt_all(X86CPU *cpu, int intno, int is_int,
 #if !defined(CONFIG_USER_ONLY)
     if (env->hflags & HF_GUEST_MASK) {
         CPUState *cs = CPU(cpu);
-        uint32_t event_inj = x86_ldl_phys(cs, env->vm_vmcb +
-                                      offsetof(struct vmcb,
-                                               control.event_inj));
 
         x86_stl_phys(cs,
                  env->vm_vmcb + offsetof(struct vmcb, control.event_inj),
-                 event_inj & ~SVM_EVTINJ_VALID);
+                 0);
+        x86_stl_phys(cs, env->vm_vmcb +
+                     offsetof(struct vmcb, control.event_inj_err), 0);
     }
 #endif
 
