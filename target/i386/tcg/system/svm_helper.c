@@ -723,12 +723,28 @@ void helper_svm_check_io(CPUX86State *env, uint32_t port, uint32_t param,
     }
 }
 
+static void dump_vmcb(CPUX86State *env, const char *msg) {
+    CPUState *cs = env_cpu(env);
+    qemu_log_mask(CPU_LOG_TB_IN_ASM, "%s:\n", msg);
+    for (size_t i = 0; i < sizeof(struct vmcb); i += 8) {
+        const uint64_t val = x86_ldq_phys(cs, env->vm_vmcb + i);
+        qemu_log_mask(CPU_LOG_TB_IN_ASM, "    %016lx\n", val);
+    }
+}
+
 void cpu_vmexit(CPUX86State *env, uint64_t exit_code, uint64_t exit_info_1,
                 uintptr_t retaddr)
 {
     CPUState *cs = env_cpu(env);
 
     cpu_restore_state(cs, retaddr);
+
+    bool debug = true;
+    debug &= (exit_code == 0x400);
+    debug &= x86_ldq_phys(
+        cs, env->vm_vmcb + offsetof(struct vmcb, control.exit_info_2)) == 0xffff800000005001ULL;
+    if (debug)
+        dump_vmcb(env, "pre");
 
     qemu_log_mask(CPU_LOG_TB_IN_ASM, "vmexit(%08x, %016" PRIx64 ", %016"
                   PRIx64 ", " TARGET_FMT_lx ")!\n",
@@ -742,8 +758,11 @@ void cpu_vmexit(CPUX86State *env, uint64_t exit_code, uint64_t exit_info_1,
              exit_code);
 
     x86_stq_phys(cs, env->vm_vmcb + offsetof(struct vmcb,
-                                             control.exit_info_1), exit_info_1),
+                                             control.exit_info_1), exit_info_1);
 
+    if (debug)
+        dump_vmcb(env, "post");
+        
     /* remove any pending exception */
     env->old_exception = -1;
     cpu_loop_exit(cs);
@@ -913,6 +932,16 @@ void do_vmexit(CPUX86State *env)
 
 
     /* FIXME: Checks the reloaded host state for consistency. */
+        // DEBUG:
+        // Print IF.
+#if 0
+#define X(size, field) x86_ld##size##_phys(cs, env->vm_vmcb + offsetof(struct vmcb, field))
+        fprintf(stderr, "svm: if=%" PRIx64 " int_ctl=%" PRIx32 " int_vector=%" PRIx32 " int_state=%" PRIx32 "\n",
+                X(q, save.rflags) & 0x0200,
+                X(l, control.int_ctl),
+                X(l, control.int_vector),
+                X(l, control.int_state));
+#endif
 
     /*
      * EFLAGS.TF causes a #DB trap after the VMRUN completes on the host
