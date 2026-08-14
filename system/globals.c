@@ -29,6 +29,7 @@
 #include "hw/xen/xen.h"
 #include "net/net.h"
 #include "system/cpus.h"
+#include "system/qvm-hooks.h"
 #include "system/system.h"
 
 bool should_mlock(MlockState state)
@@ -66,6 +67,9 @@ int only_migratable; /* turn it off unless user states otherwise */
  */
 QemuUUID qemu_uuid;
 bool qemu_uuid_set;
+
+/* Set by libqvm; see "system/qvm-hooks.h". */
+void (*qvm_io_exit_hook)(CPUState *cs, uintptr_t retaddr);
 
 uint32_t xen_domid;
 enum xen_mode xen_mode = XEN_DISABLED;

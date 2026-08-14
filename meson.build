@@ -4396,6 +4396,23 @@ foreach target : target_dirs
     lib_deps += dep.partial_dependency(compile_args: true, includes: true)
   endforeach
 
+  # QVM: a KVM API implementation backed by this target's system emulation,
+  # linked by applications instead of by QEMU itself.  Only the x86_64 target
+  # can host it, since the guest ABI it exposes is KVM's x86 one.
+  if target == 'x86_64-softmmu'
+    qvm_srcs = files(
+      'qvm/qvm-fd.c',
+      'qvm/qvm-machine.c',
+      'qvm/qvm-vcpu.c',
+      'qvm/qvm-vm.c',
+    )
+    qvm_inc = target_inc + [
+      include_directories('linux-headers', is_system: true),
+      include_directories('qvm/linux-compat', is_system: true),
+      include_directories('qvm'),
+    ]
+  endif
+
   lib = static_library('qemu-' + target,
                  sources: arch_srcs + genh,
                  dependencies: lib_deps,
@@ -4403,6 +4420,17 @@ foreach target : target_dirs
                  include_directories: target_inc,
                  c_args: c_args,
                  build_by_default: false)
+
+  if target == 'x86_64-softmmu'
+    libqvm = shared_library('qvm', qvm_srcs + genh,
+               install: true,
+               c_args: c_args,
+               dependencies: arch_deps + [target_stubs],
+               objects: lib.extract_all_objects(recursive: true),
+               include_directories: qvm_inc,
+               link_args: link_args)
+    install_headers('include/qvm/qvm.h', subdir: 'qvm')
+  endif
 
   if target.endswith('-softmmu')
     execs = [{
