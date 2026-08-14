@@ -23,6 +23,9 @@
 #include "cpu.h"
 #include "exec/helper-proto.h"
 #include "exec/cputlb.h"
+#ifndef CONFIG_USER_ONLY
+#include "system/qvm-hooks.h"
+#endif
 #include "helper-tcg.h"
 
 /*
@@ -54,8 +57,18 @@ void helper_cpuid(CPUX86State *env)
 
     cpu_svm_check_intercept_param(env, SVM_EXIT_CPUID, 0, GETPC());
 
-    cpu_x86_cpuid(env, (uint32_t)env->regs[R_EAX], (uint32_t)env->regs[R_ECX],
-                  &eax, &ebx, &ecx, &edx);
+#ifndef CONFIG_USER_ONLY
+    if (unlikely(qvm_cpuid_hook) &&
+        qvm_cpuid_hook(env_cpu(env), (uint32_t)env->regs[R_EAX],
+                       (uint32_t)env->regs[R_ECX],
+                       &eax, &ebx, &ecx, &edx)) {
+        /* Answered from the QVM client's KVM_SET_CPUID2 table. */
+    } else
+#endif
+    {
+        cpu_x86_cpuid(env, (uint32_t)env->regs[R_EAX],
+                      (uint32_t)env->regs[R_ECX], &eax, &ebx, &ecx, &edx);
+    }
     env->regs[R_EAX] = eax;
     env->regs[R_EBX] = ebx;
     env->regs[R_ECX] = ecx;

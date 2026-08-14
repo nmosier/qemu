@@ -8,6 +8,7 @@
 #include "qemu/osdep.h"
 #include "qemu/lockable.h"
 #include "qvm/qvm.h"
+#include "qvm-arch.h"
 #include "qvm-internal.h"
 
 #include <stdarg.h>
@@ -119,16 +120,35 @@ int qvm_close(int fd)
  */
 int qvm_check_extension(unsigned long cap)
 {
+    int arch = qvm_arch_check_extension(cap);
+
+    if (arch >= 0) {
+        return arch;
+    }
+
     switch (cap) {
     case KVM_CAP_USER_MEMORY:
     case KVM_CAP_SET_TSS_ADDR:
     case KVM_CAP_SET_IDENTITY_MAP_ADDR:
+    case KVM_CAP_SYNC_MMU:
+    case KVM_CAP_IMMEDIATE_EXIT:
         return 1;
+
     case KVM_CAP_NR_VCPUS:
     case KVM_CAP_MAX_VCPUS:
         return QVM_MAX_VCPUS;
     case KVM_CAP_NR_MEMSLOTS:
         return QVM_MAX_MEMSLOTS;
+
+    /*
+     * Deliberately absent.  QVM has no in-kernel interrupt controller -- that
+     * is the client's job -- and no coalesced MMIO ring, so every MMIO access
+     * is reported individually.  Clients read a zero here as "do it yourself",
+     * which is what QVM wants.
+     */
+    case KVM_CAP_IRQCHIP:
+    case KVM_CAP_COALESCED_MMIO:
+    case KVM_CAP_ONE_REG:
     default:
         return 0;
     }
@@ -158,11 +178,11 @@ static int qvm_sys_ioctl(unsigned long request, uintptr_t arg)
         return qvm_check_extension(arg);
 
     default:
-        return qvm_err(ENOTTY);
+        return qvm_arch_sys_ioctl(request, arg);
     }
 }
 
-int qvm_ioctl(int fd, unsigned long request, ...)
+int qvm_ioctl(int fd, unsigned long request_in, ...)
 {
     QvmFd *f;
     QvmFdType type;
@@ -171,12 +191,20 @@ int qvm_ioctl(int fd, unsigned long request, ...)
     va_list ap;
 
     /*
+     * Request numbers are 32 bits.  Take only those, the way the kernel's
+     * syscall entry does: callers commonly hold them in an int, where the
+     * _IOR-encoded ones are negative and would otherwise arrive here
+     * sign-extended.
+     */
+    unsigned long request = request_in & 0xffffffffUL;
+
+    /*
      * KVM's request numbers encode whether the argument is a pointer to a
      * struct or a bare scalar.  That distinction matters here in a way it does
      * not for ioctl(2) on Linux/x86: on hosts that pass variadic arguments on
      * the stack, reading an int-sized argument as a pointer picks up garbage.
      */
-    va_start(ap, request);
+    va_start(ap, request_in);
     if (_IOC_DIR(request) == _IOC_NONE) {
         arg = va_arg(ap, unsigned int);
     } else {

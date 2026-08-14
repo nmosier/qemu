@@ -40,57 +40,117 @@ client's.
 
 ### Exits
 
-`KVM_EXIT_HLT` falls out of `cpu_exec()` naturally.  `KVM_EXIT_IO` is harder:
-the trap has to stop the vCPU at an instruction boundary, but it is discovered
-deep inside a `MemoryRegion` callback with an RCU read section (and possibly
-the BQL) still held, where unwinding would strand both.
+`KVM_EXIT_HLT` falls out of `cpu_exec()` naturally.  `KVM_EXIT_IO` and
+`KVM_EXIT_MMIO` are harder: the trap has to stop the vCPU at an instruction
+boundary, but it is discovered deep inside a `MemoryRegion` callback with an
+RCU read section (and possibly the BQL) still held, where unwinding would
+strand both.
 
-So the callback in `qvm-vm.c` only *records* the exit, and the unwind happens
-once the access has returned to the x86 port I/O helper, via the
-`qvm_io_exit_hook` in `include/system/qvm-hooks.h`.  That hook rewinds the
-guest to the start of the faulting instruction, which gives the client KVM's
-restart semantics: the instruction re-executes on the next `KVM_RUN`, and the
-trap handler completes it from the shared page instead of trapping again.
+So the callbacks in `qvm-vm.c` only *record* the exit, and the unwind happens
+once the access has completed, via the `qvm_io_exit_hook` in
+`include/system/qvm-hooks.h`.  Port I/O reaches it from the x86 I/O helpers;
+MMIO reaches it from cputlb's failed-transaction path, which QVM's catch-all
+region enters by returning `MEMTX_ERROR`.  Either way the hook rewinds the
+guest to the start of the faulting instruction, giving the client KVM's restart
+semantics: the instruction re-executes on the next `KVM_RUN`, and the trap
+handler completes it from the shared page instead of trapping again.
 
-## Building
+### Interrupts and signals
 
-QVM is built as part of QEMU; configure a tree with the x86_64 system target
-and build `libqvm`:
+QVM has no in-kernel interrupt controller: `KVM_CAP_IRQCHIP` reads 0, the vCPU
+is built without a local APIC, and the guest's APIC page comes out as a
+`KVM_EXIT_MMIO`.  The client delivers vectors with `KVM_INTERRUPT`, and asks to
+be told when the guest can accept one with `kvm_run::request_interrupt_window`
+(answered by `KVM_EXIT_IRQ_WINDOW_OPEN`).
+
+`KVM_SET_SIGNAL_MASK` works the way clients rely on: the mask is installed
+around the guest run, and delivery of a signal it unblocks ends `KVM_RUN` with
+`KVM_EXIT_INTR` and `EINTR`.  A signal raised while an I/O access is still
+outstanding is held off until that access has been delivered to the guest, so
+the zero-length entry clients use to complete an I/O and return immediately
+behaves as it does under KVM.
+
+## Guest architectures
+
+QVM is built as part of QEMU, once per guest architecture.  The KVM ABI a
+client compiles against *is* the guest's, so a single libqvm cannot speak for
+two of them: give each its own build directory.
 
 ```
-./configure --target-list=x86_64-softmmu
-ninja -C build libqvm.dylib     # libqvm.so on ELF hosts
+./configure --target-list=x86_64-softmmu   && ninja -C build libqvm.so
+./configure --target-list=aarch64-softmmu  && ninja -C build-arm libqvm.so
 ```
 
-`include/qvm/qvm.h` is the public header.  Clients that include
-`<linux/kvm.h>` on a non-Linux host also want `-isystem qvm/linux-compat
--isystem linux-headers`, which supply the KVM UAPI headers and the few kernel
-definitions (`__u64`, Linux's `_IOC` encoding) they rest on.
+| guest | backend | state |
+|-------|---------|-------|
+| x86_64 | `qvm-x86.c` | runs Linux under gem5, SE and FS, 1 and 2 cores |
+| aarch64 | `qvm-arm.c` | registers and interrupt lines only; no VGIC yet |
+
+`qvm/qvm-arch.h` is the line between them.  QVM's core -- descriptors, memory
+slots, the run loop, exits, signals -- is genuinely architecture independent,
+because that much of KVM's API is; what is not is the vCPU's state and how
+interrupts reach it.
+
+`include/qvm/qvm.h` is the public header.  Clients also need the KVM UAPI
+headers, and on a non-Linux host the few kernel definitions they rest on:
+
+```
+-isystem <qemu>/qvm/linux-compat-x86     # or linux-compat-arm64
+-isystem <qemu>/qvm/linux-compat
+-isystem <qemu>/linux-headers
+```
+
+Put the architecture directory first; it decides which guest ABI
+`<asm/kvm.h>` describes.
 
 ## Environment
 
 | Variable  | Default    | Meaning                              |
 |-----------|------------|--------------------------------------|
-| `QVM_CPU` | `qemu64`   | x86 CPU model to emulate             |
-| `QVM_SMP` | `1`        | vCPUs the client may create          |
+| `QVM_CPU` | `max`      | CPU model to emulate                 |
 | `QVM_LOG` | unset      | QEMU `-d` categories, e.g. `int,mmu` |
+
+`QVM_CPU` matters more than it looks.  A client describes the CPU it wants the
+guest to see itself (on x86, with `KVM_SET_CPUID2`), and anything it
+advertises that the emulated CPU cannot execute becomes an
+undefined-instruction trap in the guest -- exactly as it would have to be
+backed by the host CPU under KVM.  Hence the most capable model by default.
+
+## Testing
+
+- `kvm-hello-world/` — the classic four-mode smoke test (real, protected,
+  32-bit paging, long mode).
+- `qvm/tests/` — a conformance test that reproduces gem5's KvmCPU call sequence
+  request for request.  See `qvm/gem5/` for running gem5 itself against QVM.
 
 ## Current limits
 
 - One VM per process, since QEMU's machine and address spaces are process-wide
   singletons.  A second `KVM_CREATE_VM` fails with `EBUSY`.
 - Guest is x86; the host can be anything QEMU targets.
-- Implemented requests: `KVM_GET_API_VERSION`, `KVM_CHECK_EXTENSION`,
-  `KVM_CREATE_VM`, `KVM_GET_VCPU_MMAP_SIZE`, `KVM_SET_USER_MEMORY_REGION`,
-  `KVM_SET_TSS_ADDR`, `KVM_SET_IDENTITY_MAP_ADDR`, `KVM_CREATE_VCPU`,
-  `KVM_RUN`, `KVM_GET_REGS`, `KVM_SET_REGS`, `KVM_GET_SREGS`, `KVM_SET_SREGS`.
-  Anything else returns `ENOTTY`.
-- Exits reported: `KVM_EXIT_HLT`, `KVM_EXIT_IO`, `KVM_EXIT_DEBUG`,
-  `KVM_EXIT_SHUTDOWN`, `KVM_EXIT_INTERNAL_ERROR`.  `KVM_EXIT_MMIO` is not
-  implemented: unassigned guest memory accesses still get QEMU's default
-  handling rather than being handed to the client.
-- No MSR, FPU/XSAVE, CPUID, interrupt-injection or dirty-log requests, and no
-  in-kernel irqchip.
+- Implemented: `KVM_GET_API_VERSION`, `KVM_CHECK_EXTENSION`, `KVM_CREATE_VM`,
+  `KVM_GET_VCPU_MMAP_SIZE`, `KVM_GET_SUPPORTED_CPUID`,
+  `KVM_GET_MSR_INDEX_LIST`, `KVM_SET_USER_MEMORY_REGION`, `KVM_SET_TSS_ADDR`,
+  `KVM_SET_IDENTITY_MAP_ADDR`, `KVM_REGISTER_COALESCED_MMIO` (accepted, no
+  ring), `KVM_CREATE_VCPU`, `KVM_RUN`, `KVM_SET_SIGNAL_MASK`, `KVM_INTERRUPT`,
+  `KVM_NMI`, and `KVM_GET`/`KVM_SET` for `REGS`, `SREGS`, `FPU`, `XSAVE`,
+  `XCRS`, `DEBUGREGS`, `VCPU_EVENTS`, `MSRS` and `CPUID2`.  Anything else
+  returns `ENOTTY`.
+- Exits reported: `KVM_EXIT_IO`, `KVM_EXIT_MMIO`, `KVM_EXIT_HLT`,
+  `KVM_EXIT_INTR`, `KVM_EXIT_IRQ_WINDOW_OPEN`, `KVM_EXIT_DEBUG`,
+  `KVM_EXIT_SHUTDOWN`, `KVM_EXIT_INTERNAL_ERROR`.
+- `KVM_GET_SUPPORTED_CPUID` needs a vCPU to exist first and returns `EAGAIN`
+  before that: QVM's "host CPU" is the emulated model, whose feature words are
+  only filled in when a CPU is realized.
+- The MSRs QVM can translate are the ones `KVM_GET_MSR_INDEX_LIST` reports;
+  `KVM_GET_MSRS`/`KVM_SET_MSRS` stop at the first index outside that set and
+  return how many they handled, as KVM does.
+- No dirty-log, no `KVM_SET_GUEST_DEBUG`, no nested virtualisation, no
+  `KVM_CREATE_IRQCHIP`/`KVM_IRQ_LINE`, no ioeventfd/irqfd.
 - Descriptors are not host file descriptors and cannot be closed, polled or
   inherited as such; `KVM_CREATE_VM`/`KVM_CREATE_VCPU` results are only valid
   as arguments to the `qvm_*` functions.
+- Request numbers are truncated to 32 bits on entry, as the kernel's syscall
+  layer does, so clients holding them in an `int` work.  For requests encoded
+  with `_IO()` the argument is read as a 32-bit scalar; KVM has no such request
+  that carries a wider value.

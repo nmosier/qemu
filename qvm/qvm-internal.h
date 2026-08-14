@@ -12,6 +12,7 @@
 #include "hw/core/cpu.h"
 #include "system/memory.h"
 
+#include <signal.h>
 #include <linux/kvm.h>
 
 /*
@@ -36,6 +37,13 @@ QEMU_BUILD_BUG_MSG(KVM_GET_API_VERSION != 0xae00,
 #define QVM_PIO_DATA_OFFSET     QVM_KVM_PAGE_SIZE
 
 typedef struct QvmVM QvmVM;
+
+/*
+ * Whatever the guest architecture needs to remember about a vCPU beyond the
+ * common state below -- interrupt-controller registers the client owns, the
+ * CPU description it installed, and so on.  Defined in qvm-x86.c / qvm-arm.c.
+ */
+typedef struct QvmVcpuArch QvmVcpuArch;
 
 typedef struct QvmMemSlot {
     bool used;
@@ -66,6 +74,21 @@ typedef struct QvmVcpu {
      * from @run rather than trapped again.
      */
     bool completing_io;
+
+    /*
+     * Signals the client wants unblocked while the guest runs
+     * (KVM_SET_SIGNAL_MASK).  Delivery of one of them ends the KVM_RUN with
+     * KVM_EXIT_INTR, which is how a client bounds a run.
+     */
+    bool has_sigmask;
+    sigset_t sigmask;
+
+    /* Cached once per mask: signals blocked outside the run but not inside. */
+    bool kick_set_valid;
+    sigset_t kick_set;
+
+    /* See QvmVcpuArch; allocated by qvm_arch_vcpu_init_state(). */
+    QvmVcpuArch *arch;
 } QvmVcpu;
 
 struct QvmVM {
@@ -79,6 +102,7 @@ struct QvmVM {
 };
 
 /* qvm-vm.c */
+void qvm_qemu_ensure_started(void);
 int qvm_vm_create(QvmVM **vmp);
 int qvm_vm_ioctl(QvmVM *vm, unsigned long request, uintptr_t arg);
 void qvm_vm_destroy(QvmVM *vm);
@@ -91,8 +115,9 @@ int qvm_vcpu_create(QvmVM *vm, int id, QvmVcpu **vcpup);
 int qvm_vcpu_ioctl(QvmVcpu *vcpu, unsigned long request, uintptr_t arg);
 void qvm_vcpu_destroy(QvmVcpu *vcpu);
 QvmVcpu *qvm_vcpu_current(void);
+QvmVcpu *qvm_vcpu_of(CPUState *cs);
 
-/* Installed as qvm_io_exit_hook; see "system/qvm-hooks.h". */
+/* Installed as the io-exit hook in "system/qvm-hooks.h". */
 void qvm_io_exit(CPUState *cs, uintptr_t retaddr);
 
 /* Record that the thread calling qemu_init() is already an RCU reader. */
@@ -100,6 +125,10 @@ void qvm_thread_mark_rcu_registered(void);
 
 /* Marks @vcpu as needing to leave cpu_exec() once the access completes. */
 void qvm_vcpu_request_exit(QvmVcpu *vcpu);
+
+/* Called by a trap handler that has just finished a previously reported
+ * access from the shared page. */
+void qvm_vcpu_io_completed(QvmVcpu *vcpu);
 
 /* Pointer to the port I/O data buffer inside the vCPU's shared pages. */
 static inline void *qvm_run_io_data(struct kvm_run *run)

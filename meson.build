@@ -4251,6 +4251,7 @@ endif
 
 traceable = []
 emulators = {}
+qvm_built = false
 foreach target : target_dirs
   config_target = config_target_mak[target]
   target_name = config_target['TARGET_NAME']
@@ -4397,17 +4398,29 @@ foreach target : target_dirs
   endforeach
 
   # QVM: a KVM API implementation backed by this target's system emulation,
-  # linked by applications instead of by QEMU itself.  Only the x86_64 target
-  # can host it, since the guest ABI it exposes is KVM's x86 one.
-  if target == 'x86_64-softmmu'
+  # linked by applications instead of by QEMU itself.  One guest architecture
+  # per build directory: the KVM ABI a client compiles against is the guest's,
+  # so a single libqvm cannot speak for two of them.
+  qvm_guests = {
+    'x86_64-softmmu': ['qvm/qvm-x86.c', 'qvm/linux-compat-x86'],
+    'aarch64-softmmu': ['qvm/qvm-arm.c', 'qvm/linux-compat-arm64'],
+  }
+  if qvm_guests.has_key(target)
+    if qvm_built
+      error('QVM supports one guest architecture per build directory; ' +
+            'configure @0@ in a directory of its own.'.format(target))
+    endif
+    qvm_built = true
     qvm_srcs = files(
       'qvm/qvm-fd.c',
       'qvm/qvm-machine.c',
       'qvm/qvm-vcpu.c',
       'qvm/qvm-vm.c',
+      qvm_guests[target][0],
     )
     qvm_inc = target_inc + [
       include_directories('linux-headers', is_system: true),
+      include_directories(qvm_guests[target][1], is_system: true),
       include_directories('qvm/linux-compat', is_system: true),
       include_directories('qvm'),
     ]
@@ -4421,7 +4434,7 @@ foreach target : target_dirs
                  c_args: c_args,
                  build_by_default: false)
 
-  if target == 'x86_64-softmmu'
+  if qvm_guests.has_key(target)
     libqvm = shared_library('qvm', qvm_srcs + genh,
                install: true,
                c_args: c_args,

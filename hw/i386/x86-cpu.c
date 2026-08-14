@@ -21,6 +21,7 @@
  * THE SOFTWARE.
  */
 #include "qemu/osdep.h"
+#include "system/qvm-hooks.h"
 #include "system/whpx.h"
 #include "system/cpu-timers.h"
 #include "trace.h"
@@ -70,6 +71,10 @@ int cpu_get_pic_interrupt(CPUX86State *env)
 {
     X86CPU *cpu = env_archcpu(env);
     int intno;
+
+    if (unlikely(qvm_pic_interrupt_hook)) {
+        return qvm_pic_interrupt_hook(env_cpu(env));
+    }
 
     if (!kvm_irqchip_in_kernel() && !whpx_irqchip_in_kernel()) {
         intno = apic_get_interrupt(cpu->apic_state);

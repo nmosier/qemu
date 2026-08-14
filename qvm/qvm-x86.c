@@ -18,10 +18,17 @@
 #include "hw/core/boards.h"
 #include "hw/core/qdev.h"
 #include "qapi/error.h"
+#include "accel/tcg/cpu-loop.h"
 #include "exec/cputlb.h"
 #include "qemu/bswap.h"
+#include "qapi/error.h"
+#include "hw/core/boards.h"
+#include "hw/core/qdev.h"
+#include "hw/i386/apic.h"
 #include "system/memory.h"
+#include "system/qvm-hooks.h"
 
+#include "qvm-arch.h"
 #include "qvm-internal.h"
 
 /*
@@ -34,6 +41,28 @@
 
 /* Bound on the CPUID table a client may install; KVM's own limit is similar. */
 #define QVM_MAX_CPUID_ENTRIES 256
+
+struct QvmVcpuArch
+{
+    /* Interrupt injection (KVM_INTERRUPT / KVM_NMI). */
+    bool irq_pending;
+    uint8_t irq_vector;
+    bool nmi_pending;
+    /* Set once an injected vector has been handed to the guest. */
+    bool irq_injected;
+
+    /*
+     * The local APIC belongs to the client, as it does with KVM's userspace
+     * irqchip, so these are QVM's copies rather than a device's state.  They
+     * round-trip through kvm_run, KVM_GET/SET_SREGS and MSR_IA32_APICBASE.
+     */
+    uint64_t apic_base;
+    uint64_t cr8;
+
+    /* The CPU the client wants the guest to see (KVM_SET_CPUID2). */
+    struct kvm_cpuid_entry2 *cpuid;
+    uint32_t cpuid_nent;
+};
 
 /* ------------------------------------------------------------------ */
 /* Segments and general purpose registers                             */
@@ -165,9 +194,9 @@ static void qvm_get_sregs(QvmVcpu *vcpu, struct kvm_sregs *sregs)
     sregs->cr2 = env->cr[2];
     sregs->cr3 = env->cr[3];
     sregs->cr4 = env->cr[4];
-    sregs->cr8 = vcpu->cr8;
+    sregs->cr8 = vcpu->arch->cr8;
     sregs->efer = env->efer;
-    sregs->apic_base = vcpu->apic_base;
+    sregs->apic_base = vcpu->arch->apic_base;
 
     /*
      * interrupt_bitmap reports interrupts KVM has accepted but not yet
@@ -207,8 +236,8 @@ static void qvm_set_sregs(QvmVcpu *vcpu, const struct kvm_sregs *sregs)
     cpu_x86_update_cr4(env, sregs->cr4);
     env->cr[3] = sregs->cr3;
 
-    vcpu->apic_base = sregs->apic_base;
-    vcpu->cr8 = sregs->cr8;
+    vcpu->arch->apic_base = sregs->apic_base;
+    vcpu->arch->cr8 = sregs->cr8;
 
     x86_update_hflags(env);
     tlb_flush(cs);
@@ -355,11 +384,11 @@ static void qvm_get_vcpu_events(QvmVcpu *vcpu, struct kvm_vcpu_events *events)
     events->exception.has_error_code = env->has_error_code;
     events->exception.error_code = env->error_code;
 
-    events->interrupt.injected = vcpu->irq_injected;
-    events->interrupt.nr = vcpu->irq_vector;
+    events->interrupt.injected = vcpu->arch->irq_injected;
+    events->interrupt.nr = vcpu->arch->irq_vector;
     events->interrupt.shadow = (env->hflags & HF_INHIBIT_IRQ_MASK) != 0;
 
-    events->nmi.pending = vcpu->nmi_pending;
+    events->nmi.pending = vcpu->arch->nmi_pending;
     events->nmi.masked = (env->hflags2 & HF2_NMI_MASK) != 0;
 
     events->sipi_vector = env->sipi_vector;
@@ -376,12 +405,12 @@ static void qvm_set_vcpu_events(QvmVcpu *vcpu,
     env->error_code = events->exception.error_code;
 
     if (events->interrupt.injected) {
-        vcpu->irq_pending = true;
-        vcpu->irq_vector = events->interrupt.nr;
+        vcpu->arch->irq_pending = true;
+        vcpu->arch->irq_vector = events->interrupt.nr;
         cpu_interrupt(vcpu->cs, CPU_INTERRUPT_HARD);
     }
 
-    vcpu->nmi_pending = events->nmi.pending;
+    vcpu->arch->nmi_pending = events->nmi.pending;
     if (events->nmi.pending) {
         cpu_interrupt(vcpu->cs, CPU_INTERRUPT_NMI);
     }
@@ -482,7 +511,7 @@ static bool qvm_msr_read(QvmVcpu *vcpu, uint32_t index, uint64_t *val)
         *val = cpu_get_tsc(env) + env->tsc_offset;
         return true;
     case MSR_IA32_APICBASE:
-        *val = vcpu->apic_base;
+        *val = vcpu->arch->apic_base;
         return true;
     case MSR_MTRRcap:
         *val = MSR_MTRRcap_VCNT | MSR_MTRRcap_FIXRANGE_SUPPORT |
@@ -528,7 +557,7 @@ static bool qvm_msr_write(QvmVcpu *vcpu, uint32_t index, uint64_t val)
         env->tsc_offset = val - cpu_get_tsc(env);
         return true;
     case MSR_IA32_APICBASE:
-        vcpu->apic_base = val;
+        vcpu->arch->apic_base = val;
         return true;
     case MSR_MTRRcap:
         /* Read-only; accept and ignore, as the hardware does. */
@@ -563,7 +592,7 @@ static bool qvm_msr_write(QvmVcpu *vcpu, uint32_t index, uint64_t val)
     return false;
 }
 
-int qvm_x86_get_msr_index_list(struct kvm_msr_list *list)
+static int qvm_x86_get_msr_index_list(struct kvm_msr_list *list)
 {
     uint32_t n = ARRAY_SIZE(qvm_msr_list);
 
@@ -626,9 +655,9 @@ static int qvm_set_cpuid2(QvmVcpu *vcpu, const struct kvm_cpuid2 *cpuid)
      * CPUID through qvm_cpuid() on another thread.
      */
     bql_lock();
-    g_free(vcpu->cpuid);
-    vcpu->cpuid = table;
-    vcpu->cpuid_nent = cpuid->nent;
+    g_free(vcpu->arch->cpuid);
+    vcpu->arch->cpuid = table;
+    vcpu->arch->cpuid_nent = cpuid->nent;
     bql_unlock();
 
     /* Translated code may have inlined CPUID results for this vCPU. */
@@ -638,29 +667,29 @@ static int qvm_set_cpuid2(QvmVcpu *vcpu, const struct kvm_cpuid2 *cpuid)
 
 static int qvm_get_cpuid2(QvmVcpu *vcpu, struct kvm_cpuid2 *cpuid)
 {
-    if (cpuid->nent < vcpu->cpuid_nent) {
-        cpuid->nent = vcpu->cpuid_nent;
+    if (cpuid->nent < vcpu->arch->cpuid_nent) {
+        cpuid->nent = vcpu->arch->cpuid_nent;
         return qvm_err(E2BIG);
     }
-    memcpy(cpuid->entries, vcpu->cpuid,
-           vcpu->cpuid_nent * sizeof(*cpuid->entries));
-    cpuid->nent = vcpu->cpuid_nent;
+    memcpy(cpuid->entries, vcpu->arch->cpuid,
+           vcpu->arch->cpuid_nent * sizeof(*cpuid->entries));
+    cpuid->nent = vcpu->arch->cpuid_nent;
     return 0;
 }
 
-bool qvm_cpuid(CPUState *cs, uint32_t function, uint32_t index,
+static bool qvm_cpuid(CPUState *cs, uint32_t function, uint32_t index,
                uint32_t *eax, uint32_t *ebx, uint32_t *ecx, uint32_t *edx)
 {
     QvmVcpu *vcpu = qvm_vcpu_of(cs);
     const struct kvm_cpuid_entry2 *entry;
     uint32_t i;
 
-    if (!vcpu || !vcpu->cpuid) {
+    if (!vcpu || !vcpu->arch || !vcpu->arch->cpuid) {
         return false;
     }
 
-    for (i = 0; i < vcpu->cpuid_nent; i++) {
-        entry = &vcpu->cpuid[i];
+    for (i = 0; i < vcpu->arch->cpuid_nent; i++) {
+        entry = &vcpu->arch->cpuid[i];
         if (entry->function != function) {
             continue;
         }
@@ -694,7 +723,7 @@ bool qvm_cpuid(CPUState *cs, uint32_t function, uint32_t index,
  * get EAGAIN.  gem5 never calls this -- X86KvmCPU::updateCPUID() builds its
  * table from gem5's own ISA model -- so the ordering costs it nothing.
  */
-int qvm_x86_get_supported_cpuid(struct kvm_cpuid2 *cpuid)
+static int qvm_x86_get_supported_cpuid(struct kvm_cpuid2 *cpuid)
 {
     /* The basic and extended leaf ranges; not a range to iterate over. */
     static const uint32_t bases[] = { 0x00000000u, 0x80000000u };
@@ -738,6 +767,217 @@ int qvm_x86_get_supported_cpuid(struct kvm_cpuid2 *cpuid)
     return 0;
 }
 
+/*
+ * Installed as qvm_pic_interrupt_hook.  Reaching here means QEMU has decided
+ * the guest can take an interrupt right now, which answers both of the things
+ * a client can ask for: a vector to deliver, or notification that the guest
+ * became interruptible.
+ */
+static int qvm_pic_interrupt(CPUState *cs)
+{
+    QvmVcpu *vcpu = qvm_vcpu_of(cs);
+
+    if (vcpu && vcpu->arch->irq_pending) {
+        vcpu->arch->irq_pending = false;
+        vcpu->arch->irq_injected = true;
+        return vcpu->arch->irq_vector;
+    }
+
+    if (vcpu && vcpu->run->request_interrupt_window) {
+        vcpu->run->exit_reason = KVM_EXIT_IRQ_WINDOW_OPEN;
+    }
+
+    /*
+     * Leave the guest without delivering anything.  This is a translation
+     * block boundary, so the guest state is already consistent and there is
+     * nothing to restore.
+     */
+    cpu_reset_interrupt(cs, CPU_INTERRUPT_HARD);
+    cs->exception_index = EXCP_INTERRUPT;
+    cpu_loop_exit(cs);
+}
+
+/* ------------------------------------------------------------------ */
+/* Architecture interface                                             */
+/* ------------------------------------------------------------------ */
+
+const char *
+qvm_arch_name(void)
+{
+    return "x86";
+}
+
+const char *
+qvm_arch_default_cpu(void)
+{
+    /*
+     * Every feature this QEMU's TCG can execute.  A leaner model quietly
+     * turns any extra feature a client claims in KVM_SET_CPUID2 into an
+     * undefined-instruction trap in the guest.
+     */
+    return "max";
+}
+
+void
+qvm_arch_machine_class_init(MachineClass *mc)
+{
+    mc->default_cpu_type = X86_CPU_TYPE_NAME("qemu64");
+}
+
+bool
+qvm_arch_has_pio(void)
+{
+    return true;
+}
+
+void
+qvm_arch_install_hooks(void)
+{
+    qvm_pic_interrupt_hook = qvm_pic_interrupt;
+    qvm_cpuid_hook = qvm_cpuid;
+}
+
+int
+qvm_arch_vcpu_realize(QvmVM *vm, int id, CPUState **csp)
+{
+    MachineState *ms;
+    Object *obj;
+    Error *err = NULL;
+
+    /*
+     * cpu_create() is not enough for x86: the APIC id is normally assigned by
+     * the board's pre-plug handler, and realize refuses to run without one.
+     * QVM has no board to do that, so number the vCPUs itself.
+     */
+    bql_lock();
+    ms = MACHINE(qdev_get_machine());
+    obj = object_new(ms->cpu_type);
+    object_property_set_int(obj, "apic-id", id, &error_abort);
+
+    /*
+     * Leave the local APIC out of the CPU.  QVM has no in-kernel irqchip: the
+     * client owns interrupt control, so the guest's APIC page has to reach it
+     * as a KVM_EXIT_MMIO rather than being answered inside QEMU.  What the
+     * guest sees in CPUID is a separate question, settled by KVM_SET_CPUID2.
+     */
+    if (!object_property_set_bool(obj, "apic", false, &err)) {
+        warn_report_err(err);
+        err = NULL;
+    }
+
+    if (!qdev_realize(DEVICE(obj), NULL, &err)) {
+        error_report_err(err);
+        object_unref(obj);
+        bql_unlock();
+        return qvm_err(EINVAL);
+    }
+
+    /*
+     * Clearing the feature bit above is not enough on its own: QEMU also
+     * creates an APIC for any machine with more than one possible CPU.  Take
+     * it back out, which unmaps the 0xfee00000 page it claimed -- otherwise it
+     * would answer the guest's APIC accesses itself and the client would never
+     * see them.
+     */
+    if (X86_CPU(obj)->apic_state) {
+        object_unparent(OBJECT(X86_CPU(obj)->apic_state));
+        X86_CPU(obj)->apic_state = NULL;
+    }
+    bql_unlock();
+
+    *csp = CPU(obj);
+    return 0;
+}
+
+void
+qvm_arch_vcpu_init_state(QvmVcpu *vcpu)
+{
+    vcpu->arch = g_new0(QvmVcpuArch, 1);
+    vcpu->arch->apic_base = APIC_DEFAULT_ADDRESS | MSR_IA32_APICBASE_ENABLE |
+                            (vcpu->id == 0 ? MSR_IA32_APICBASE_BSP : 0);
+}
+
+void
+qvm_arch_prepare_run(QvmVcpu *vcpu)
+{
+    struct kvm_run *run = vcpu->run;
+
+    /* The client owns the APIC; take back what it may have changed. */
+    vcpu->arch->cr8 = run->cr8;
+    vcpu->arch->apic_base = run->apic_base;
+
+    /*
+     * Keep QEMU's pending-interrupt flag in step with what the client wants,
+     * so qvm_pic_interrupt() is only ever reached with something to say.
+     */
+    bql_lock();
+    if (vcpu->arch->irq_pending || run->request_interrupt_window) {
+        cpu_interrupt(vcpu->cs, CPU_INTERRUPT_HARD);
+    } else {
+        cpu_reset_interrupt(vcpu->cs, CPU_INTERRUPT_HARD);
+    }
+    bql_unlock();
+}
+
+void
+qvm_arch_update_run_state(QvmVcpu *vcpu)
+{
+    CPUX86State *env = cpu_env(vcpu->cs);
+    bool interruptible;
+
+    interruptible = (cpu_compute_eflags(env) & IF_MASK) &&
+                    !(env->hflags & HF_INHIBIT_IRQ_MASK);
+
+    vcpu->run->if_flag = interruptible;
+    vcpu->run->ready_for_interrupt_injection =
+        interruptible && !vcpu->arch->irq_pending;
+    vcpu->run->cr8 = vcpu->arch->cr8;
+    vcpu->run->apic_base = vcpu->arch->apic_base;
+}
+
+int
+qvm_arch_check_extension(unsigned long cap)
+{
+    switch (cap) {
+    case KVM_CAP_EXT_CPUID:
+    case KVM_CAP_USER_NMI:
+    case KVM_CAP_VCPU_EVENTS:
+    case KVM_CAP_DEBUGREGS:
+    case KVM_CAP_XSAVE:
+    case KVM_CAP_XCRS:
+        return 1;
+    default:
+        return -1;
+    }
+}
+
+int
+qvm_arch_sys_ioctl(unsigned long request, uintptr_t arg)
+{
+    switch (request) {
+    case KVM_GET_SUPPORTED_CPUID:
+        if (!arg) {
+            return qvm_err(EFAULT);
+        }
+        return qvm_x86_get_supported_cpuid((struct kvm_cpuid2 *)arg);
+
+    case KVM_GET_MSR_INDEX_LIST:
+        if (!arg) {
+            return qvm_err(EFAULT);
+        }
+        return qvm_x86_get_msr_index_list((struct kvm_msr_list *)arg);
+
+    default:
+        return qvm_err(ENOTTY);
+    }
+}
+
+int
+qvm_arch_vm_ioctl(QvmVM *vm, unsigned long request, uintptr_t arg)
+{
+    return qvm_err(ENOTTY);
+}
+
 /* ------------------------------------------------------------------ */
 /* Dispatch                                                           */
 /* ------------------------------------------------------------------ */
@@ -769,9 +1009,38 @@ int qvm_x86_get_supported_cpuid(struct kvm_cpuid2 *cpuid)
         return 0;                                           \
     } while (0)
 
-int qvm_x86_ioctl(QvmVcpu *vcpu, unsigned long request, uintptr_t arg)
+int
+qvm_arch_vcpu_ioctl(QvmVcpu *vcpu, unsigned long request, uintptr_t arg)
 {
     switch (request) {
+    case KVM_INTERRUPT: {
+        struct kvm_interrupt intr;
+
+        if (!arg) {
+            return qvm_err(EFAULT);
+        }
+        memcpy(&intr, (void *)arg, sizeof(intr));
+        if (intr.irq >= 256) {
+            return qvm_err(EINVAL);
+        }
+        if (vcpu->arch->irq_pending) {
+            return qvm_err(EEXIST);
+        }
+        vcpu->arch->irq_pending = true;
+        vcpu->arch->irq_vector = intr.irq;
+        bql_lock();
+        cpu_interrupt(vcpu->cs, CPU_INTERRUPT_HARD);
+        bql_unlock();
+        return 0;
+    }
+
+    case KVM_NMI:
+        vcpu->arch->nmi_pending = true;
+        bql_lock();
+        cpu_interrupt(vcpu->cs, CPU_INTERRUPT_NMI);
+        bql_unlock();
+        return 0;
+
     case KVM_GET_REGS:
         QVM_IOCTL_GET(struct kvm_regs, qvm_get_regs);
     case KVM_SET_REGS:

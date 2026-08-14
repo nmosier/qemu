@@ -70,6 +70,10 @@ bool qemu_uuid_set;
 
 /* Set by libqvm; see "system/qvm-hooks.h". */
 void (*qvm_io_exit_hook)(CPUState *cs, uintptr_t retaddr);
+int (*qvm_pic_interrupt_hook)(CPUState *cs);
+bool (*qvm_cpuid_hook)(CPUState *cs, uint32_t function, uint32_t index,
+                       uint32_t *eax, uint32_t *ebx,
+                       uint32_t *ecx, uint32_t *edx);
 
 uint32_t xen_domid;
 enum xen_mode xen_mode = XEN_DISABLED;

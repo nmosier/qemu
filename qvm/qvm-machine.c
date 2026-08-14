@@ -11,9 +11,9 @@
  */
 
 #include "qemu/osdep.h"
-#include "cpu.h"
 #include "hw/core/boards.h"
 
+#include "qvm-arch.h"
 #include "qvm-internal.h"
 
 static void qvm_machine_init(MachineState *machine)
@@ -26,7 +26,6 @@ static void qvm_machine_class_init(MachineClass *mc)
     mc->desc = "QVM (KVM API emulated on TCG)";
     mc->init = qvm_machine_init;
     mc->max_cpus = QVM_MAX_VCPUS;
-    mc->default_cpu_type = X86_CPU_TYPE_NAME("qemu64");
 
     /* The client owns the machine's memory map, so QEMU allocates none. */
     mc->default_ram_size = 0;
@@ -36,6 +35,8 @@ static void qvm_machine_class_init(MachineClass *mc)
     mc->no_parallel = 1;
     mc->no_floppy = 1;
     mc->no_cdrom = 1;
+
+    qvm_arch_machine_class_init(mc);
 }
 
 DEFINE_MACHINE("qvm", qvm_machine_class_init)

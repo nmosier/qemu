@@ -23,6 +23,7 @@
 #include "system/system.h"
 #include "qom/object.h"
 
+#include "qvm-arch.h"
 #include "qvm-internal.h"
 
 /*
@@ -45,20 +46,22 @@ static QemuThread qvm_main_loop_thread;
 bool qvm_shutdown;
 
 static MemoryRegion qvm_pio_mr;
+static MemoryRegion qvm_mmio_mr;
 
 /*
- * Port I/O.  Every port the client has not claimed with a device lands here
- * and becomes a KVM_EXIT_IO.
+ * Port I/O and unassigned memory.  Anything the client has not backed with a
+ * memory slot lands in one of these regions and becomes a KVM_EXIT_IO or a
+ * KVM_EXIT_MMIO: under QVM there are no emulated devices, because emulating
+ * them is exactly what the client is for.
  *
- * These callbacks run inside an RCU read section, so they only record the exit;
- * the actual unwind out of cpu_exec() happens in qvm_io_exit_hook() once the
- * access has unwound back to the x86 I/O helper.
+ * These callbacks run inside an RCU read section, so they only record the
+ * exit; the unwind out of cpu_exec() happens in qvm_io_exit() once the access
+ * has completed and those locks are gone.
  */
 static uint64_t qvm_pio_read(void *opaque, hwaddr addr, unsigned size)
 {
     QvmVcpu *vcpu = qvm_vcpu_current();
     struct kvm_run *run;
-    uint64_t val = 0;
 
     if (!vcpu) {
         /* Not a guest access (monitor, migration, ...): read as open bus. */
@@ -72,9 +75,8 @@ static uint64_t qvm_pio_read(void *opaque, hwaddr addr, unsigned size)
          * result in the shared page; the guest instruction is being
          * re-executed to consume it.
          */
-        vcpu->completing_io = false;
-        memcpy(&val, qvm_run_io_data(run), MIN(size, sizeof(val)));
-        return val;
+        qvm_vcpu_io_completed(vcpu);
+        return ldn_le_p(qvm_run_io_data(run), size);
     }
 
     run->exit_reason = KVM_EXIT_IO;
@@ -101,7 +103,7 @@ static void qvm_pio_write(void *opaque, hwaddr addr, uint64_t data,
 
     if (vcpu->completing_io) {
         /* Already reported; re-executing the instruction must not repeat it. */
-        vcpu->completing_io = false;
+        qvm_vcpu_io_completed(vcpu);
         return;
     }
 
@@ -111,9 +113,87 @@ static void qvm_pio_write(void *opaque, hwaddr addr, uint64_t data,
     run->io.port = addr;
     run->io.count = 1;
     run->io.data_offset = QVM_PIO_DATA_OFFSET;
-    memcpy(qvm_run_io_data(run), &data, MIN(size, sizeof(data)));
+    stn_le_p(qvm_run_io_data(run), size, data);
     qvm_vcpu_request_exit(vcpu);
 }
+
+/*
+ * MMIO differs from port I/O only in how the unwind is reached: cputlb calls
+ * io_failed() -- and with it qvm_io_exit() -- when a dispatch returns anything
+ * other than MEMTX_OK, which is the one place in the memory path that runs
+ * after the access with a usable return address.
+ */
+static MemTxResult qvm_mmio_read(void *opaque, hwaddr addr, uint64_t *data,
+                                 unsigned size, MemTxAttrs attrs)
+{
+    QvmVcpu *vcpu = qvm_vcpu_current();
+    struct kvm_run *run;
+
+    if (!vcpu) {
+        *data = (uint64_t)-1;
+        return MEMTX_OK;
+    }
+    run = vcpu->run;
+
+    if (vcpu->completing_io) {
+        qvm_vcpu_io_completed(vcpu);
+        *data = ldn_le_p(run->mmio.data, size);
+        return MEMTX_OK;
+    }
+
+    run->exit_reason = KVM_EXIT_MMIO;
+    run->mmio.phys_addr = addr;
+    run->mmio.len = size;
+    run->mmio.is_write = 0;
+    memset(run->mmio.data, 0, sizeof(run->mmio.data));
+    qvm_vcpu_request_exit(vcpu);
+
+    *data = 0;
+    return MEMTX_ERROR;
+}
+
+static MemTxResult qvm_mmio_write(void *opaque, hwaddr addr, uint64_t data,
+                                  unsigned size, MemTxAttrs attrs)
+{
+    QvmVcpu *vcpu = qvm_vcpu_current();
+    struct kvm_run *run;
+
+    if (!vcpu) {
+        return MEMTX_OK;
+    }
+    run = vcpu->run;
+
+    if (vcpu->completing_io) {
+        qvm_vcpu_io_completed(vcpu);
+        return MEMTX_OK;
+    }
+
+    run->exit_reason = KVM_EXIT_MMIO;
+    run->mmio.phys_addr = addr;
+    run->mmio.len = size;
+    run->mmio.is_write = 1;
+    memset(run->mmio.data, 0, sizeof(run->mmio.data));
+    stn_le_p(run->mmio.data, size, data);
+    qvm_vcpu_request_exit(vcpu);
+
+    return MEMTX_ERROR;
+}
+
+static const MemoryRegionOps qvm_mmio_ops = {
+    .read_with_attrs = qvm_mmio_read,
+    .write_with_attrs = qvm_mmio_write,
+    .endianness = DEVICE_LITTLE_ENDIAN,
+    .valid = {
+        .min_access_size = 1,
+        .max_access_size = 8,
+        .unaligned = true,
+    },
+    .impl = {
+        .min_access_size = 1,
+        .max_access_size = 8,
+        .unaligned = true,
+    },
+};
 
 static const MemoryRegionOps qvm_pio_ops = {
     .read = qvm_pio_read,
@@ -143,11 +223,15 @@ static void qvm_create_vcpu_thread(CPUState *cpu)
 static void qvm_kick_vcpu_thread(CPUState *cpu)
 {
     /*
-     * cpus_kick_thread() would pthread_kill() the client's thread, which has
-     * no SIG_IPI handler of its own.  Setting exit_request is enough: the vCPU
-     * checks it between translation blocks.
+     * Translated code polls icount_decr and nothing else, so driving the high
+     * half negative is what actually makes a running vCPU leave its
+     * translation block -- exit_request alone would never be noticed by a
+     * guest sitting in a self-chained loop.
+     *
+     * The default kick signals the vCPU thread instead, which QVM must not do:
+     * that thread belongs to the client and its signal state is the client's.
      */
-    qatomic_set(&cpu->exit_request, true);
+    qatomic_set(&cpu->neg.icount_decr.u16.high, -1);
 }
 
 static void *qvm_main_loop(void *opaque)
@@ -165,36 +249,35 @@ static void *qvm_main_loop(void *opaque)
     return NULL;
 }
 
-static unsigned qvm_env_uint(const char *name, unsigned def)
-{
-    const char *val = getenv(name);
-    unsigned long n;
-    char *end;
-
-    if (!val || !*val) {
-        return def;
-    }
-    n = strtoul(val, &end, 0);
-    if (*end || n == 0) {
-        return def;
-    }
-    return n;
-}
-
 /*
  * The client never sees a QEMU command line, so the few knobs worth exposing
  * are read from the environment:
  *
- *   QVM_CPU  x86 CPU model to emulate               (default "qemu64")
- *   QVM_SMP  number of vCPUs the client may create  (default 1)
+ *   QVM_CPU  x86 CPU model to emulate               (default "max")
  *   QVM_LOG  QEMU -d log categories, e.g. "int,mmu" (default off)
  */
-static void qvm_qemu_start(void)
+static void qvm_qemu_start()
 {
     AccelOpsClass *ops;
-    unsigned nr_cpus = MIN(qvm_env_uint("QVM_SMP", 1), QVM_MAX_VCPUS);
-    g_autofree char *smp = g_strdup_printf("%u", nr_cpus);
-    const char *cpu_model = getenv("QVM_CPU") ?: "qemu64";
+    /*
+     * Always give TCG room for the maximum number of vCPUs QVM supports
+     * rather than for however many the client turns out to create.  The pool
+     * of translation contexts is sized from this once, at startup, and each
+     * client thread that runs a vCPU claims one; sizing it to a guess means
+     * an assertion failure deep in TCG the moment the client creates a second
+     * vCPU.  The machine builds no CPUs of its own, so a generous number here
+     * costs nothing.
+     */
+    g_autofree char *smp = g_strdup_printf("1,maxcpus=%u", QVM_MAX_VCPUS);
+    /*
+     * "max" is every feature this QEMU's TCG can actually execute.  The model
+     * matters more here than it looks: a client describes the CPU it wants the
+     * guest to see with KVM_SET_CPUID2, and whatever it advertises has to be
+     * backed by an implementation, exactly as it has to be backed by the host
+     * CPU under KVM.  A leaner model quietly turns any extra feature the
+     * client claims into #UD in the guest.
+     */
+    const char *cpu_model = getenv("QVM_CPU") ?: qvm_arch_default_cpu();
     const char *log = getenv("QVM_LOG");
     g_autoptr(GPtrArray) argv = g_ptr_array_new();
 
@@ -218,6 +301,8 @@ static void qvm_qemu_start(void)
 
     qemu_init(argv->len, (char **)argv->pdata);
 
+    free(extra_args);
+
     /*
      * qemu_init() returns holding the BQL and the replay lock, expecting its
      * caller to hand them to whichever thread runs the event loop.
@@ -226,11 +311,25 @@ static void qvm_qemu_start(void)
     ops->create_vcpu_thread = qvm_create_vcpu_thread;
     ops->kick_vcpu_thread = qvm_kick_vcpu_thread;
 
-    memory_region_init_io(&qvm_pio_mr, NULL, &qvm_pio_ops, NULL,
-                          "qvm-pio", 0x10000);
-    memory_region_add_subregion_overlap(get_system_io(), 0, &qvm_pio_mr, -1);
+    if (qvm_arch_has_pio()) {
+        memory_region_init_io(&qvm_pio_mr, NULL, &qvm_pio_ops, NULL,
+                              "qvm-pio", 0x10000);
+        memory_region_add_subregion_overlap(get_system_io(), 0,
+                                            &qvm_pio_mr, -1);
+    }
+
+    /*
+     * Sits underneath every memory slot the client will add, so that whatever
+     * it did not back with real memory reaches it as a KVM_EXIT_MMIO instead
+     * of being silently dropped.
+     */
+    memory_region_init_io(&qvm_mmio_mr, NULL, &qvm_mmio_ops, NULL,
+                          "qvm-mmio", UINT64_MAX);
+    memory_region_add_subregion_overlap(get_system_memory(), 0,
+                                        &qvm_mmio_mr, -1);
 
     qvm_io_exit_hook = qvm_io_exit;
+    qvm_arch_install_hooks();
 
     /* qemu_init() registered this thread with RCU on our behalf. */
     qvm_thread_mark_rcu_registered();
@@ -245,6 +344,23 @@ static void qvm_qemu_start(void)
     qvm_qemu_running = true;
 }
 
+void qvm_qemu_ensure_started(void)
+{
+    static QemuMutex start_lock;
+    static bool start_lock_ready;
+
+    /* Constructors run before any client call, so this is not a race. */
+    if (!start_lock_ready) {
+        qemu_mutex_init(&start_lock);
+        start_lock_ready = true;
+    }
+
+    QEMU_LOCK_GUARD(&start_lock);
+    if (!qvm_qemu_running) {
+        qvm_qemu_start();
+    }
+}
+
 int qvm_vm_create(QvmVM **vmp)
 {
     QvmVM *vm;
@@ -253,9 +369,7 @@ int qvm_vm_create(QvmVM **vmp)
         return qvm_err(EBUSY);
     }
 
-    if (!qvm_qemu_running) {
-        qvm_qemu_start();
-    }
+    qvm_qemu_ensure_started();
 
     vm = g_new0(QvmVM, 1);
     qemu_mutex_init(&vm->lock);
@@ -365,10 +479,20 @@ int qvm_vm_ioctl(QvmVM *vm, unsigned long request, uintptr_t arg)
         vm->identity_map_addr = *(uint64_t *)arg;
         return 0;
 
+    case KVM_REGISTER_COALESCED_MMIO:
+    case KVM_UNREGISTER_COALESCED_MMIO:
+        /*
+         * Coalescing is an optimisation: QVM reports every MMIO access
+         * individually instead, so there is nothing to set up.  Accept the
+         * request rather than fail a client that asked for a region it does
+         * not actually depend on.
+         */
+        return 0;
+
     case KVM_CHECK_EXTENSION:
         return qvm_check_extension(arg);
 
     default:
-        return qvm_err(ENOTTY);
+        return qvm_arch_vm_ioctl(vm, request, arg);
     }
 }

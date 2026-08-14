@@ -40,6 +40,7 @@
 #include "exec/log.h"
 #include "exec/helper-proto-common.h"
 #include "exec/tlb-flags.h"
+#include "system/qvm-hooks.h"
 #include "qemu/atomic.h"
 #include "qemu/atomic128.h"
 #include "tb-internal.h"
@@ -1292,6 +1293,9 @@ static void io_failed(CPUState *cpu, CPUTLBEntryFull *full, vaddr addr,
                       unsigned size, MMUAccessType access_type, int mmu_idx,
                       MemTxResult response, uintptr_t retaddr)
 {
+    /* A QVM client emulates unassigned memory itself; see KVM_EXIT_MMIO. */
+    qvm_io_exit_check(cpu, retaddr);
+
     if (!cpu->ignore_memory_transaction_failures
         && cpu->cc->tcg_ops->do_transaction_failed) {
         hwaddr physaddr = full->phys_addr | (addr & ~TARGET_PAGE_MASK);
