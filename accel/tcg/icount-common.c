@@ -108,10 +108,7 @@ int64_t icount_budget_consume(CPUState *cpu)
 {
     int64_t executed = icount_get_executed(cpu);
 
-    /*
-     * No seqlock and no shared counter: everything touched here belongs to
-     * @cpu.  That is the whole point -- see the comment in icount.h.
-     */
+    /* No lock required, since we're only mutating a local counter. */
     cpu->icount_budget -= executed;
     return executed;
 }

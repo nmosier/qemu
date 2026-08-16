@@ -401,7 +401,7 @@ void qemu_plugin_halt_vcpu(unsigned int vcpu_index)
     /*
      * The common case is a plugin stopping the vCPU whose callback it is
      * running in, where the CPU is already to hand and no lookup or locking
-     * is needed.  Anything else has to go and find it.
+     * is needed. Anything else has to go and find it.
      */
     if (!cpu || cpu->cpu_index != (int)vcpu_index) {
         cpu = qemu_get_cpu(vcpu_index);

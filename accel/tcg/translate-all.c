@@ -185,11 +185,6 @@ void cpu_restore_state_from_tb(CPUState *cpu, TranslationBlock *tb,
         /*
          * Reset the cycle counter to the start of the block and
          * shift if to the number of actually executed instructions.
-         *
-         * The flag on the block is the whole condition: the counter was
-         * armed by whoever asked for the instrumentation, which need not be
-         * icount mode, and either way a block that did not run to the end
-         * must not be charged for the instructions it never executed.
          */
         cpu->neg.icount_decr.u16.low += insns_left;
     }
