@@ -48,8 +48,6 @@ struct QvmVcpuArch
     bool irq_pending;
     uint8_t irq_vector;
     bool nmi_pending;
-    /* Set once an injected vector has been handed to the guest. */
-    bool irq_injected;
 
     /*
      * The local APIC belongs to the client, as it does with KVM's userspace
@@ -384,7 +382,18 @@ static void qvm_get_vcpu_events(QvmVcpu *vcpu, struct kvm_vcpu_events *events)
     events->exception.has_error_code = env->has_error_code;
     events->exception.error_code = env->error_code;
 
-    events->interrupt.injected = vcpu->arch->irq_injected;
+    /*
+     * "injected" means an interrupt is in the injection slot and the guest
+     * has not taken it yet -- which is exactly irq_pending, and exactly what
+     * qvm_set_vcpu_events() reads back.  Delivery consumes it: by the time
+     * qvm_pic_interrupt() has handed the vector to the guest there is
+     * nothing left half-delivered to report.
+     *
+     * Reporting anything stickier than this wedges a client that waits for
+     * the vCPU to quiesce -- gem5 refuses to drain while an interrupt is
+     * injected, so a flag that never clears is a drain that never finishes.
+     */
+    events->interrupt.injected = vcpu->arch->irq_pending;
     events->interrupt.nr = vcpu->arch->irq_vector;
     events->interrupt.shadow = (env->hflags & HF_INHIBIT_IRQ_MASK) != 0;
 
@@ -779,7 +788,6 @@ static int qvm_pic_interrupt(CPUState *cs)
 
     if (vcpu && vcpu->arch->irq_pending) {
         vcpu->arch->irq_pending = false;
-        vcpu->arch->irq_injected = true;
         return vcpu->arch->irq_vector;
     }
 
@@ -1103,3 +1111,9 @@ qvm_arch_vcpu_ioctl(QvmVcpu *vcpu, unsigned long request, uintptr_t arg)
         return qvm_err(ENOTTY);
     }
 }
+
+/*
+ * x86 accepts any machine, so the generic definition is enough here.  See the
+ * comment on qvm_machine_class_init() for why this is not in qvm-machine.c.
+ */
+DEFINE_MACHINE("qvm", qvm_machine_class_init)

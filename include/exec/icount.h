@@ -43,6 +43,19 @@ extern ICountMode use_icount;
  */
 void icount_update(CPUState *cpu);
 
+/*
+ * Charge a CPU's own instruction budget for what it has just executed, and
+ * return how many instructions that was.
+ *
+ * This is the half of icount_update() that does not touch the virtual clock.
+ * icount mode makes the instruction count *be* time, which is why it has to
+ * serialise the vCPUs to keep that clock coherent.  A caller that only wants
+ * to count and bound one CPU -- and keeps its own notion of time, as a
+ * hypervisor's client does -- can arm the counter itself and settle up here
+ * instead, leaving the other vCPUs free to run at the same time.
+ */
+int64_t icount_budget_consume(CPUState *cpu);
+
 /* get raw icount value */
 int64_t icount_get_raw(void);
 

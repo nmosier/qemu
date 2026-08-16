@@ -48,6 +48,7 @@
 #include "exec/translation-block.h"
 #include "exec/translator.h"
 #include "disas/disas.h"
+#include "system/qvm-hooks.h"
 #include "plugin.h"
 
 /* Uninstall and Reset handlers */
@@ -391,6 +392,33 @@ qemu_plugin_mem_value qemu_plugin_mem_get_value(qemu_plugin_meminfo_t info)
 int qemu_plugin_num_vcpus(void)
 {
     return plugin_num_vcpus();
+}
+
+void qemu_plugin_halt_vcpu(unsigned int vcpu_index)
+{
+    CPUState *cpu = current_cpu;
+
+    /*
+     * The common case is a plugin stopping the vCPU whose callback it is
+     * running in, where the CPU is already to hand and no lookup or locking
+     * is needed.  Anything else has to go and find it.
+     */
+    if (!cpu || cpu->cpu_index != (int)vcpu_index) {
+        cpu = qemu_get_cpu(vcpu_index);
+        if (!cpu) {
+            return;
+        }
+    }
+
+    /*
+     * Tell QVM first: cpu_exit() only gets the vCPU out of translated code,
+     * and without a record of why it left, whoever is running it would take
+     * that for an ordinary interruption and resume.
+     */
+    if (unlikely(qvm_plugin_halt_hook)) {
+        qvm_plugin_halt_hook(cpu);
+    }
+    cpu_exit(cpu);
 }
 
 /*

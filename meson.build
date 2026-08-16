@@ -4414,6 +4414,7 @@ foreach target : target_dirs
     qvm_srcs = files(
       'qvm/qvm-fd.c',
       'qvm/qvm-machine.c',
+      'qvm/qvm-plugin.c',
       'qvm/qvm-vcpu.c',
       'qvm/qvm-vm.c',
       qvm_guests[target][0],
@@ -4435,13 +4436,25 @@ foreach target : target_dirs
                  build_by_default: false)
 
   if qvm_guests.has_key(target)
+    # Emulators restrict their exports to the TCG plugin API so that a plugin
+    # resolves against that and nothing else.  libqvm cannot: it has to export
+    # its own entry points as well, or no client can call them.  Drop the
+    # restriction rather than try to merge two export lists.
+    qvm_link_args = []
+    foreach arg : link_args
+      if not (arg.contains('exported_symbols_list') or
+              arg.contains('dynamic-list'))
+        qvm_link_args += arg
+      endif
+    endforeach
+
     libqvm = shared_library('qvm', qvm_srcs + genh,
                install: true,
                c_args: c_args,
                dependencies: arch_deps + [target_stubs],
                objects: lib.extract_all_objects(recursive: true),
                include_directories: qvm_inc,
-               link_args: link_args)
+               link_args: qvm_link_args)
     install_headers('include/qvm/qvm.h', subdir: 'qvm')
   endif
 

@@ -21,7 +21,14 @@ static void qvm_machine_init(MachineState *machine)
     /* Nothing to build; see the file comment. */
 }
 
-static void qvm_machine_class_init(MachineClass *mc)
+/*
+ * Registering the machine itself is left to the architecture backend.  Which
+ * machines a target will even consider is target-specific: ARM filters the
+ * list by an interface that a plain DEFINE_MACHINE does not carry, so a
+ * generic definition here would be invisible to qemu-system-aarch64 while
+ * working perfectly well on x86.
+ */
+void qvm_machine_class_init(MachineClass *mc)
 {
     mc->desc = "QVM (KVM API emulated on TCG)";
     mc->init = qvm_machine_init;
@@ -38,5 +45,3 @@ static void qvm_machine_class_init(MachineClass *mc)
 
     qvm_arch_machine_class_init(mc);
 }
-
-DEFINE_MACHINE("qvm", qvm_machine_class_init)

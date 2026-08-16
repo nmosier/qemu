@@ -20,11 +20,15 @@
 #include "cpu.h"
 #include "accel/tcg/cpu-loop.h"
 #include "exec/cputlb.h"
+#include "exec/icount.h"
 #include "exec/translation-block.h"
 #include "hw/core/boards.h"
 #include "hw/core/cpu.h"
 #include "system/cpus.h"
+#include "system/qvm-hooks.h"
 #include "tcg/startup.h"
+
+#include "qvm/qvm.h"
 
 #include "qvm-arch.h"
 #include "qvm-internal.h"
@@ -102,6 +106,27 @@ void qvm_io_exit(CPUState *cs, uintptr_t retaddr)
     vcpu->exit_pending = false;
     cs->exception_index = EXCP_INTERRUPT;
     cpu_loop_exit_restore(cs, retaddr);
+}
+
+/*
+ * Installed as qvm_plugin_halt_hook: a plugin callback has asked this vCPU to
+ * stop.  Only record it -- the caller follows with cpu_exit(), which is what
+ * actually brings the vCPU out of translated code, at the end of the block it
+ * is running.  Unwinding from here instead would be no more precise, since a
+ * plugin callback has no way to name the instruction boundary it wants.
+ */
+static void qvm_plugin_halt(CPUState *cs)
+{
+    QvmVcpu *vcpu = qvm_vcpu_of(cs);
+
+    if (vcpu) {
+        qatomic_set(&vcpu->plugin_halt, true);
+    }
+}
+
+void qvm_vcpu_install_hooks(void)
+{
+    qvm_plugin_halt_hook = qvm_plugin_halt;
 }
 
 /* ------------------------------------------------------------------ */
@@ -317,7 +342,19 @@ int qvm_vcpu_create(QvmVM *vm, int id, QvmVcpu **vcpup)
      * non-atomic sequences.  A single vCPU never notices; two deadlock on the
      * first lock they contend.
      */
-    tcg_cflags_set(cs, (cs->cluster_index << CF_CLUSTER_SHIFT) | CF_PARALLEL);
+    /*
+     * CF_USE_ICOUNT makes each translated block decrement the CPU's own
+     * instruction counter, which is what lets QVM report and bound guest
+     * instructions.  It is *not* icount mode: QEMU turns that on globally to
+     * make the instruction count serve as the virtual clock, and then has to
+     * run the vCPUs round-robin to keep that clock coherent.  QVM wants only
+     * the counting -- its client owns time, and the machine has no emulated
+     * devices for a virtual clock to drive -- so it asks for the
+     * instrumentation per vCPU and leaves icount_enabled() false, which is
+     * what keeps MTTCG and CF_PARALLEL above.
+     */
+    tcg_cflags_set(cs, (cs->cluster_index << CF_CLUSTER_SHIFT) | CF_PARALLEL |
+                       CF_USE_ICOUNT);
     bql_unlock();
 
     qvm_vcpu_bind(vcpu);
@@ -339,6 +376,62 @@ void qvm_vcpu_destroy(QvmVcpu *vcpu)
 /* KVM_RUN                                                             */
 /* ------------------------------------------------------------------ */
 
+/*
+ * How many instructions to let the guest run between settlements when the
+ * client has not asked for a bound.  Large enough that the arithmetic below
+ * costs nothing measurable, small enough to stay far from overflow.
+ */
+#define QVM_ICOUNT_SLICE (1 << 30)
+
+/*
+ * Arm the vCPU's instruction counter for one pass through cpu_exec(), and
+ * return what it was armed with.
+ */
+static int64_t qvm_icount_arm(QvmVcpu *vcpu)
+{
+    CPUState *cs = vcpu->cs;
+    int64_t budget = vcpu->insn_budget ? (int64_t)vcpu->insn_budget
+                                       : QVM_ICOUNT_SLICE;
+    int32_t low = MIN(0xffff, budget);
+
+    /*
+     * Split the same way icount does: the counter translated code decrements
+     * is only 16 bits wide, so anything above that is held back and refilled
+     * from cpu_loop_exec_tb() as the low half runs out.
+     */
+    cs->icount_budget = budget;
+    cs->neg.icount_decr.u16.low = low;
+    cs->icount_extra = budget - low;
+    return budget;
+}
+
+/* Charge the counter for what ran, and return that count. */
+static uint64_t qvm_icount_settle(QvmVcpu *vcpu, int64_t armed)
+{
+    CPUState *cs = vcpu->cs;
+    uint64_t executed;
+
+    /*
+     * Measure against what was armed rather than against this call's return:
+     * cpu_exec() settles up and refills on its own each time the 16-bit half
+     * runs out, so by now the budget may have been consumed several times
+     * over.  What survives all of that is the remainder, and the difference
+     * is what the guest actually retired.
+     */
+    icount_budget_consume(cs);
+    executed = armed - MAX(cs->icount_budget, 0);
+
+    cs->icount_budget = 0;
+    cs->neg.icount_decr.u16.low = 0;
+    cs->icount_extra = 0;
+
+    vcpu->insns += executed;
+    if (vcpu->insn_budget) {
+        vcpu->insn_budget -= MIN(executed, vcpu->insn_budget);
+    }
+    return executed;
+}
+
 static int qvm_vcpu_run(QvmVcpu *vcpu)
 {
     CPUState *cs = vcpu->cs;
@@ -346,7 +439,12 @@ static int qvm_vcpu_run(QvmVcpu *vcpu)
     sigset_t saved_mask;
     bool mask_swapped = false;
     bool completion_done = false;
+    bool had_budget = vcpu->insn_budget != 0;
+    int64_t armed;
     int ret;
+
+    vcpu->halt_reason = QVM_HALT_NONE;
+    qatomic_set(&vcpu->plugin_halt, false);
 
     qvm_arch_prepare_run(vcpu);
 
@@ -408,9 +506,11 @@ static int qvm_vcpu_run(QvmVcpu *vcpu)
             completion_done = true;
         }
 
+        armed = qvm_icount_arm(vcpu);
         cpu_exec_start(cs);
         ret = cpu_exec(cs);
         cpu_exec_end(cs);
+        qvm_icount_settle(vcpu, armed);
 
         if (ret == EXCP_HLT || ret == EXCP_HALTED) {
             run->exit_reason = KVM_EXIT_HLT;
@@ -427,6 +527,22 @@ static int qvm_vcpu_run(QvmVcpu *vcpu)
         if (ret == EXCP_INTERRUPT || ret == EXCP_YIELD) {
             /* A trap handler filled run in before unwinding us. */
             if (run->exit_reason != KVM_EXIT_UNKNOWN) {
+                break;
+            }
+            /*
+             * Or the run was cut short by something only QVM can do.  Both
+             * look to the client like a signal arriving -- the run ended with
+             * nothing for it to service -- and qvm_vcpu_halt_reason() says
+             * which it was.
+             */
+            if (qatomic_read(&vcpu->plugin_halt)) {
+                run->exit_reason = KVM_EXIT_INTR;
+                vcpu->halt_reason = QVM_HALT_PLUGIN;
+                break;
+            }
+            if (had_budget && !vcpu->insn_budget) {
+                run->exit_reason = KVM_EXIT_INTR;
+                vcpu->halt_reason = QVM_HALT_INSN_BUDGET;
                 break;
             }
             continue;

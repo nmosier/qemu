@@ -21,6 +21,7 @@
 #include "cpregs.h"
 #include "accel/tcg/cpu-loop.h"
 #include "exec/cputlb.h"
+#include "hw/arm/machines-qom.h"
 #include "hw/core/boards.h"
 #include "hw/core/qdev.h"
 #include "system/memory.h"
@@ -192,6 +193,45 @@ static const ARMCPRegInfo *qvm_arm_sysreg(ARMCPU *cpu, uint64_t id)
 /* ONE_REG                                                            */
 /* ------------------------------------------------------------------ */
 
+/* op0 = 3, op1 = 0, CRn = 0, CRm = 0, op2 = 5. */
+#define QVM_SYSREG_MPIDR_EL1                                                \
+    (KVM_REG_ARM64 | KVM_REG_SIZE_U64 | KVM_REG_ARM64_SYSREG |              \
+     (3ULL << KVM_REG_ARM64_SYSREG_OP0_SHIFT) |                             \
+     (5ULL << KVM_REG_ARM64_SYSREG_OP2_SHIFT))
+
+/*
+ * Writing a system register through this API is not quite QEMU's raw write.
+ * A client uses it to say what it wants the CPU to be -- MPIDR is how it
+ * states a vCPU's affinity -- and QEMU keeps some of those as values it
+ * derives rather than values it stores.
+ */
+static void qvm_arm_sysreg_write(ARMCPU *cpu, const ARMCPRegInfo *ri,
+                                 uint64_t id, uint64_t val)
+{
+    if (id == QVM_SYSREG_MPIDR_EL1) {
+        /*
+         * Read-only to the guest and computed from the CPU's affinity, so
+         * there is no field to write.  Set the affinity instead, which is
+         * what the client is really asking for.
+         */
+        cpu->mp_affinity = val;
+        return;
+    }
+
+    if (!(ri->type & ARM_CP_CONST) && !ri->writefn && !ri->raw_writefn &&
+        !ri->fieldoffset) {
+        /*
+         * Nowhere to put it: the register is derived or read-only and QVM has
+         * no better answer than QEMU does.  Drop the write rather than reach
+         * for a field that is not there -- a library must not abort the
+         * process that called it.
+         */
+        return;
+    }
+
+    write_raw_cp_reg(&cpu->env, ri, val);
+}
+
 static unsigned qvm_arm_reg_bytes(uint64_t id)
 {
     switch (id & KVM_REG_SIZE_MASK) {
@@ -251,7 +291,18 @@ static int qvm_arm_one_reg(QvmVcpu *vcpu, const struct kvm_one_reg *reg,
         if (!qvm_arm_core_reg(env, reg->id, &val, write)) {
             return qvm_err(EINVAL);
         }
-        if (!write) {
+        if (write) {
+            /*
+             * Writing PSTATE can change the exception level, and the flags
+             * translation depends on are cached rather than derived per
+             * instruction.  Under real KVM nothing caches them, so a client
+             * has no reason to expect it must ask for a recomputation --
+             * which makes this QVM's job.
+             */
+            bql_lock();
+            arm_rebuild_hflags(env);
+            bql_unlock();
+        } else {
             memcpy((void *)(uintptr_t)reg->addr, &val, size);
         }
         return 0;
@@ -264,7 +315,9 @@ static int qvm_arm_one_reg(QvmVcpu *vcpu, const struct kvm_one_reg *reg,
         if (write) {
             memcpy(&val, (void *)(uintptr_t)reg->addr, size);
             bql_lock();
-            raw_write(env, ri, val);
+            qvm_arm_sysreg_write(cpu, ri, reg->id, val);
+            /* SCTLR, TCR, HCR and CPACR all feed the cached flags. */
+            arm_rebuild_hflags(env);
             bql_unlock();
         } else {
             bql_lock();
@@ -370,6 +423,22 @@ qvm_arch_vcpu_realize(QvmVM *vm, int id, CPUState **csp)
     obj = object_new(ms->cpu_type);
 
     object_property_set_int(obj, "mp-affinity", id, &error_abort);
+
+    /*
+     * A KVM vCPU is a non-secure EL1 guest: the hypervisor keeps EL2, and EL3
+     * is not something a guest ever sees.  QEMU's CPU models implement both by
+     * default, which leaves the vCPU sitting in Secure state with EL2
+     * disabled -- and there HCR_EL2.TGE reads as one, so the guest's first
+     * "eret" to EL1 is an illegal return and every instruction after it traps.
+     * Turn them off so the vCPU a client gets is the one KVM would have given
+     * it.
+     */
+    if (object_property_find(obj, "has_el3")) {
+        object_property_set_bool(obj, "has_el3", false, &error_abort);
+    }
+    if (object_property_find(obj, "has_el2")) {
+        object_property_set_bool(obj, "has_el2", false, &error_abort);
+    }
 
     /*
      * The client resets and starts vCPUs itself through the KVM API, so QEMU
@@ -563,3 +632,10 @@ qvm_arch_vcpu_ioctl(QvmVcpu *vcpu, unsigned long request, uintptr_t arg)
         return qvm_err(ENOTTY);
     }
 }
+
+/*
+ * qemu-system-aarch64 only offers machines carrying the aarch64 machine
+ * interface, so the qvm machine has to be declared with it or it is not in
+ * the list -M searches.  See the comment on qvm_machine_class_init().
+ */
+DEFINE_MACHINE_AARCH64("qvm", qvm_machine_class_init)

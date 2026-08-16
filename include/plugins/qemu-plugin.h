@@ -1009,6 +1009,26 @@ QEMU_PLUGIN_API
 int qemu_plugin_num_vcpus(void);
 
 /**
+ * qemu_plugin_halt_vcpu() - ask a vCPU to stop executing
+ * @vcpu_index: the vCPU to stop
+ *
+ * Stops the vCPU at the end of the translated block it is running, so a
+ * plugin that decides mid-stream that it has seen enough can bring the guest
+ * to a halt rather than only recording that it went past.  The guest stops on
+ * an instruction boundary, within one block of the request -- not necessarily
+ * on the very next instruction.
+ *
+ * What "stop" means belongs to whoever is driving the emulator.  Under QVM the
+ * KVM_RUN in progress returns to the client, which decides whether to resume;
+ * under a normal QEMU the vCPU merely leaves translated code and continues, as
+ * there is nobody to hand it to.
+ *
+ * Safe to call from any plugin callback, including on another vCPU's thread.
+ */
+QEMU_PLUGIN_API
+void qemu_plugin_halt_vcpu(unsigned int vcpu_index);
+
+/**
  * qemu_plugin_outs() - output string via QEMU's logging system
  * @string: a string
  */

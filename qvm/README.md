@@ -116,12 +116,36 @@ advertises that the emulated CPU cannot execute becomes an
 undefined-instruction trap in the guest -- exactly as it would have to be
 backed by the host CPU under KVM.  Hence the most capable model by default.
 
+## Instrumenting the guest
+
+`qvm_load_plugin()` loads a QEMU TCG plugin into the emulator running the
+guest.  This is the one thing QVM offers that the API it emulates cannot: under
+KVM the guest executes on real hardware and there is nothing to instrument,
+while under QVM every guest instruction is translated first.
+
+```c
+qvm_load_plugin("/path/to/libbbv.so", "outfile=bbv,interval=100000");
+```
+
+Arguments are QEMU's `-plugin` syntax, so what works on a QEMU command line
+works here.  The call is accepted before or after the guest starts; a plugin
+loaded once it is running discards already-translated code so that it is
+instrumented on its next execution.
+
+QEMU must be configured with `--enable-plugins`.  Note that this also changes
+how libqvm is linked: emulators restrict their exported symbols to the plugin
+API, which libqvm cannot do -- it has to export its own entry points too -- so
+that restriction is dropped for it.
+
 ## Testing
 
 - `kvm-hello-world/` — the classic four-mode smoke test (real, protected,
   32-bit paging, long mode).
 - `qvm/tests/` — a conformance test that reproduces gem5's KvmCPU call sequence
   request for request.  See `qvm/gem5/` for running gem5 itself against QVM.
+- `gem5/configs/example/qvm-plugin-bbv.py` — runs a workload under gem5's
+  `X86KvmCPU` with `contrib/plugins/bbv.c` attached, collecting a basic block
+  vector from a guest a KVM CPU could not otherwise see inside.
 
 ## Current limits
 
@@ -147,6 +171,8 @@ backed by the host CPU under KVM.  Hence the most capable model by default.
   return how many they handled, as KVM does.
 - No dirty-log, no `KVM_SET_GUEST_DEBUG`, no nested virtualisation, no
   `KVM_CREATE_IRQCHIP`/`KVM_IRQ_LINE`, no ioeventfd/irqfd.
+- `qvm_load_plugin()` needs a QEMU configured with `--enable-plugins`; without
+  it the call compiles but does nothing.
 - Descriptors are not host file descriptors and cannot be closed, polled or
   inherited as such; `KVM_CREATE_VM`/`KVM_CREATE_VCPU` results are only valid
   as arguments to the `qvm_*` functions.

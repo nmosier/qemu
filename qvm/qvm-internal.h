@@ -76,6 +76,27 @@ typedef struct QvmVcpu {
     bool completing_io;
 
     /*
+     * Guest instructions this vCPU has retired, and how many more the client
+     * will allow before the run ends (zero meaning it has not asked for a
+     * bound).  Both are exact: the count comes from the same per-block
+     * decrement icount uses, which is charged for a block only if the block
+     * ran, and refunded if it was abandoned part way.
+     */
+    uint64_t insns;
+    uint64_t insn_budget;
+
+    /*
+     * Why the last run ended, for the endings KVM has no reason code for.
+     * Both surface to the client as KVM_EXIT_INTR -- a run cut short with
+     * nothing to service, which is exactly what a signal would have done --
+     * and qvm_vcpu_halt_reason() tells them apart.
+     */
+    unsigned halt_reason;
+
+    /* Set from a plugin callback, possibly on another thread. */
+    bool plugin_halt;
+
+    /*
      * Signals the client wants unblocked while the guest runs
      * (KVM_SET_SIGNAL_MASK).  Delivery of one of them ends the KVM_RUN with
      * KVM_EXIT_INTR, which is how a client bounds a run.
@@ -110,12 +131,21 @@ void qvm_vm_destroy(QvmVM *vm);
 /* Set once QEMU's event loop has exited; reported as KVM_EXIT_SHUTDOWN. */
 extern bool qvm_shutdown;
 
+/* Whether the QEMU instance behind QVM has been started yet. */
+bool qvm_qemu_is_running(void);
+
+/* qvm-plugin.c: add the plugins queued before startup to QEMU's argv. */
+void qvm_plugin_append_args(GPtrArray *argv);
+
 /* qvm-vcpu.c */
 int qvm_vcpu_create(QvmVM *vm, int id, QvmVcpu **vcpup);
 int qvm_vcpu_ioctl(QvmVcpu *vcpu, unsigned long request, uintptr_t arg);
 void qvm_vcpu_destroy(QvmVcpu *vcpu);
 QvmVcpu *qvm_vcpu_current(void);
 QvmVcpu *qvm_vcpu_of(CPUState *cs);
+
+/* Installs the hooks in "system/qvm-hooks.h" that are not per-architecture. */
+void qvm_vcpu_install_hooks(void);
 
 /* Installed as the io-exit hook in "system/qvm-hooks.h". */
 void qvm_io_exit(CPUState *cs, uintptr_t retaddr);

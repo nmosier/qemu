@@ -38,6 +38,16 @@ static inline void qvm_io_exit_check(CPUState *cs, uintptr_t retaddr)
 }
 
 /**
+ * qvm_plugin_halt_hook: a TCG plugin asked for @cs to stop executing.
+ *
+ * Plugins observe the guest; this is the one thing they can ask it to do.
+ * QVM records the request so that the KVM_RUN in progress returns to the
+ * client instead of resuming, which is what makes the stop visible outside
+ * the emulator at all.
+ */
+extern void (*qvm_plugin_halt_hook)(CPUState *cs);
+
+/**
  * qvm_pic_interrupt_hook: source the vector for a pending hardware interrupt.
  *
  * QVM's client owns the interrupt controller, so vectors arrive over

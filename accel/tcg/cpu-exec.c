@@ -908,10 +908,26 @@ static inline void cpu_loop_exec_tb(CPUState *cpu, TranslationBlock *tb,
     }
 
     /* Instruction counter expired.  */
-    assert(icount_enabled());
 #ifndef CONFIG_USER_ONLY
-    /* Ensure global icount has gone forward */
-    icount_update(cpu);
+    if (icount_enabled()) {
+        /* Ensure global icount has gone forward */
+        icount_update(cpu);
+    } else {
+        /*
+         * The counter was armed for this CPU alone, by a caller that keeps
+         * its own time (see icount_budget_consume()).  Nothing will refill
+         * the budget behind our back the way icount's clock does, so charge
+         * what ran and hand control back once it is spent.
+         */
+        icount_budget_consume(cpu);
+        if (cpu->icount_budget <= 0) {
+            cpu->icount_budget = 0;
+            cpu->neg.icount_decr.u16.low = 0;
+            cpu->icount_extra = 0;
+            cpu->exception_index = EXCP_INTERRUPT;
+            cpu_loop_exit(cpu);
+        }
+    }
     /* Refill decrementer and continue execution.  */
     int32_t insns_left = MIN(0xffff, cpu->icount_budget);
     cpu->neg.icount_decr.u16.low = insns_left;

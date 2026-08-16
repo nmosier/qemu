@@ -256,7 +256,7 @@ static void *qvm_main_loop(void *opaque)
  *   QVM_CPU  x86 CPU model to emulate               (default "max")
  *   QVM_LOG  QEMU -d log categories, e.g. "int,mmu" (default off)
  */
-static void qvm_qemu_start()
+static void qvm_qemu_start(void)
 {
     AccelOpsClass *ops;
     /*
@@ -298,10 +298,9 @@ static void qvm_qemu_start()
         g_ptr_array_add(argv, (char *)"-d");
         g_ptr_array_add(argv, (char *)log);
     }
+    qvm_plugin_append_args(argv);
 
     qemu_init(argv->len, (char **)argv->pdata);
-
-    free(extra_args);
 
     /*
      * qemu_init() returns holding the BQL and the replay lock, expecting its
@@ -329,6 +328,7 @@ static void qvm_qemu_start()
                                         &qvm_mmio_mr, -1);
 
     qvm_io_exit_hook = qvm_io_exit;
+    qvm_vcpu_install_hooks();
     qvm_arch_install_hooks();
 
     /* qemu_init() registered this thread with RCU on our behalf. */
@@ -341,7 +341,12 @@ static void qvm_qemu_start()
 
     qemu_thread_create(&qvm_main_loop_thread, "qvm-main-loop",
                        qvm_main_loop, NULL, QEMU_THREAD_DETACHED);
-    qvm_qemu_running = true;
+    qatomic_set(&qvm_qemu_running, true);
+}
+
+bool qvm_qemu_is_running(void)
+{
+    return qatomic_read(&qvm_qemu_running);
 }
 
 void qvm_qemu_ensure_started(void)

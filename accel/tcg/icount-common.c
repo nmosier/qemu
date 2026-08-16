@@ -104,6 +104,18 @@ void icount_update(CPUState *cpu)
                          &timers_state.vm_clock_lock);
 }
 
+int64_t icount_budget_consume(CPUState *cpu)
+{
+    int64_t executed = icount_get_executed(cpu);
+
+    /*
+     * No seqlock and no shared counter: everything touched here belongs to
+     * @cpu.  That is the whole point -- see the comment in icount.h.
+     */
+    cpu->icount_budget -= executed;
+    return executed;
+}
+
 static int64_t icount_get_raw_locked(void)
 {
     CPUState *cpu = current_cpu;

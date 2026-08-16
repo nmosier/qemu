@@ -36,6 +36,14 @@ const char *qvm_arch_default_cpu(void);
 void qvm_arch_machine_class_init(MachineClass *mc);
 
 /**
+ * qvm_machine_class_init: the architecture-independent half of the machine.
+ *
+ * Each backend registers the qvm machine itself, with whatever its target
+ * requires to accept one, and points the registration here.
+ */
+void qvm_machine_class_init(MachineClass *mc);
+
+/**
  * qvm_arch_has_pio: whether the guest architecture has a port I/O space.
  *
  * Only x86 does; elsewhere everything is memory mapped and QVM registers no

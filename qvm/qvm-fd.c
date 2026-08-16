@@ -287,3 +287,72 @@ int qvm_munmap(void *addr, size_t length)
     }
     return munmap(addr, length);
 }
+
+/* ------------------------------------------------------------------ */
+/* Instruction counting                                               */
+/* ------------------------------------------------------------------ */
+
+static QvmVcpu *qvm_fd_vcpu(int fd)
+{
+    QvmFd *f = qvm_fd_lookup(fd);
+
+    if (!f || f->type != QVM_FD_VCPU) {
+        return NULL;
+    }
+    return f->vcpu;
+}
+
+int qvm_vcpu_insns(int fd, unsigned long long *insns)
+{
+    QvmVcpu *vcpu;
+
+    if (!insns) {
+        return qvm_err(EFAULT);
+    }
+
+    QEMU_LOCK_GUARD(&qvm_fd_lock);
+    vcpu = qvm_fd_vcpu(fd);
+    if (!vcpu) {
+        return qvm_err(EBADF);
+    }
+
+    /*
+     * Read straight out of the vCPU rather than settling the counter first:
+     * this is called from the thread that owns the vCPU, between runs, where
+     * qvm_vcpu_run() has already accounted for everything executed.
+     */
+    *insns = vcpu->insns;
+    return 0;
+}
+
+int qvm_vcpu_set_insn_budget(int fd, unsigned long long insns)
+{
+    QvmVcpu *vcpu;
+
+    QEMU_LOCK_GUARD(&qvm_fd_lock);
+    vcpu = qvm_fd_vcpu(fd);
+    if (!vcpu) {
+        return qvm_err(EBADF);
+    }
+
+    vcpu->insn_budget = insns;
+    return 0;
+}
+
+int qvm_vcpu_halt_reason(int fd, unsigned *reason)
+{
+    QvmVcpu *vcpu;
+
+    if (!reason) {
+        return qvm_err(EFAULT);
+    }
+
+    QEMU_LOCK_GUARD(&qvm_fd_lock);
+    vcpu = qvm_fd_vcpu(fd);
+    if (!vcpu) {
+        return qvm_err(EBADF);
+    }
+
+    *reason = vcpu->halt_reason;
+    return 0;
+}

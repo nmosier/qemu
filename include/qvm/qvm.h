@@ -70,6 +70,76 @@ void *qvm_mmap(void *addr, size_t length, int prot, int flags,
  */
 int qvm_munmap(void *addr, size_t length);
 
+/**
+ * qvm_vcpu_insns: guest instructions this vCPU has retired.
+ * @fd: a vCPU descriptor from KVM_CREATE_VCPU.
+ * @insns: filled in with the running total.
+ *
+ * QVM translates the guest, so unlike KVM it can say exactly how much work a
+ * vCPU has done without any host counter to read.  The count covers only
+ * instructions the guest actually completed: one abandoned part way through a
+ * translated block -- by a trap, or by an access that became a KVM_EXIT_MMIO
+ * -- is not counted until it is re-executed and finishes.
+ *
+ * Returns 0, or -1 with errno set.
+ */
+int qvm_vcpu_insns(int fd, unsigned long long *insns);
+
+/**
+ * qvm_vcpu_set_insn_budget: run the guest for a bounded number of instructions.
+ * @fd: a vCPU descriptor from KVM_CREATE_VCPU.
+ * @insns: how many more instructions to allow, or 0 to remove the bound.
+ *
+ * The budget spans KVM_RUN calls and is consumed as the guest executes.  When
+ * it reaches zero the run ends with KVM_EXIT_INTR, as a signal would have
+ * ended it; the guest stops on an instruction boundary, having executed
+ * exactly the number asked for.  Setting a new budget resumes.
+ *
+ * This has no equivalent in KVM, where the closest a client can come is
+ * arranging for a signal to arrive at roughly the right time.
+ *
+ * Returns 0, or -1 with errno set.
+ */
+int qvm_vcpu_set_insn_budget(int fd, unsigned long long insns);
+
+/*
+ * Reasons a run ended that KVM has no reason code for.  All of them report
+ * KVM_EXIT_INTR to keep the API the one being emulated; this says which.
+ */
+#define QVM_HALT_NONE         0  /* ended for a reason KVM_RUN already gives */
+#define QVM_HALT_INSN_BUDGET  1  /* qvm_vcpu_set_insn_budget() was exhausted */
+#define QVM_HALT_PLUGIN       2  /* a TCG plugin called qemu_plugin_halt_vcpu */
+
+/**
+ * qvm_vcpu_halt_reason: why the last KVM_RUN on @fd ended.
+ * @reason: filled in with one of the QVM_HALT_* values above.
+ *
+ * Only meaningful when that run reported KVM_EXIT_INTR; anything else leaves
+ * it QVM_HALT_NONE, since the exit already says why.
+ *
+ * Returns 0, or -1 with errno set.
+ */
+int qvm_vcpu_halt_reason(int fd, unsigned *reason);
+
+/**
+ * qvm_load_plugin: load a QEMU TCG plugin into the emulator running the guest.
+ * @path: the plugin shared object, as QEMU's -plugin file= would take it.
+ * @args: plugin arguments in QEMU's "name=value,name=value" form, or NULL.
+ *
+ * QVM runs its guest under TCG, so QEMU's plugin interface -- instruction and
+ * block callbacks, memory tracing, and so on -- is available to a client that
+ * asks for it.  This has no equivalent in KVM, where the guest runs on real
+ * hardware and there is nothing to instrument; it is the one thing QVM offers
+ * that the API it emulates cannot.
+ *
+ * May be called before or after the guest starts.  Plugins loaded once the
+ * guest is already running see everything from that point on: code translated
+ * earlier is discarded so that it is instrumented on its next execution.
+ *
+ * Returns 0, or -1 with errno set.
+ */
+int qvm_load_plugin(const char *path, const char *args);
+
 #ifdef __cplusplus
 }
 #endif

@@ -70,6 +70,7 @@ bool qemu_uuid_set;
 
 /* Set by libqvm; see "system/qvm-hooks.h". */
 void (*qvm_io_exit_hook)(CPUState *cs, uintptr_t retaddr);
+void (*qvm_plugin_halt_hook)(CPUState *cs);
 int (*qvm_pic_interrupt_hook)(CPUState *cs);
 bool (*qvm_cpuid_hook)(CPUState *cs, uint32_t function, uint32_t index,
                        uint32_t *eax, uint32_t *ebx,
